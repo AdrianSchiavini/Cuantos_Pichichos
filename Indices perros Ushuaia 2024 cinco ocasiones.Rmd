@@ -1,0 +1,227 @@
+---
+title: "Indices perros Ushuaia 2024"
+output: html_document
+date: "2025-05-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+
+library(tidyverse)
+library(purrr)
+library(broom)
+
+```
+
+
+Estima densidades para cada transecta y relevamiento del 2024
+```{r}
+Transectas_Ushuaia <- read_csv2("Ushuaia_2024_datos.txt") %>%
+  select(3,2)
+
+Perro_Ush_ocasion_2024 <- read_csv2("Historia Ushuaia cruda.csv") %>%
+# descarto columna Perro  
+select(-2) %>%
+ # reemplazo SF por un 1 para contar perros diferentes por transecta ocasion 
+  mutate(across(starts_with("Muestreo"), 
+                ~ if_else(.x =="SF", "1", .x))) %>%
+# convierte caracter en numérico para las ocasiones, columnas 2 a 6
+    mutate(across(2:6, as.numeric)) %>%
+  # pivoto largo para agrupar  
+  pivot_longer(cols=c(2:6), names_to="Ocasion", values_to = "Perro") %>%
+    filter(Perro == 1) %>%
+# agrupo por transecta ocasion
+  group_by(Transecta , Ocasion) %>%
+# llego a perros diferentes por transecta y ocasion
+      summarise(conteo=n()) %>%
+  pivot_wider(names_from = "Ocasion", values_from = "conteo") %>%
+  # reordeno
+  select(1:4,6,5) %>%
+  mutate(across(everything(), ~ replace_na(.x, 0))) 
+
+# pega longitud de transectas (Longitud en metros) y CONSERVA los conteos:
+# hacen falta para el índice de razón (perros contados / km recorridos)
+Ushuaia_conteo_km_2024 <- Perro_Ush_ocasion_2024 %>%
+  left_join(Transectas_Ushuaia, by="Transecta") %>%
+  ungroup()
+
+# control: transectas con longitud que no aparecen en la historia. Si se recorrieron,
+# tienen conteo 0 y deben sumarse al denominador (km) del índice.
+transectas_sin_registro <- anti_join(Transectas_Ushuaia, Perro_Ush_ocasion_2024, by = "Transecta")
+if (nrow(transectas_sin_registro) > 0) {
+  cat("Transectas con longitud y sin registros en la historia:",
+      paste(transectas_sin_registro$Transecta, collapse = ", "), "\n")
+} else cat("Todas las transectas con longitud tienen registros en la historia.\n")
+
+# calcula densidad (perros/km) para cada transecta y ocasion; es sólo descriptiva
+Ushuaia_Densidad_2024 <- Ushuaia_conteo_km_2024 %>%
+# calcula densidad x transecta y ocasion  
+  mutate(Densidad_1 = round(`Muestreo 1`/Longitud *1000,1)) %>%
+  mutate(Densidad_2 = round(`Muestreo 2`/Longitud *1000,1)) %>%
+  mutate(Densidad_3 = round(`Muestreo 3`/Longitud *1000,1)) %>%
+  mutate(Densidad_4 = round(`Muestreo 4`/Longitud *1000,1)) %>%
+  mutate(Densidad_5 = round(`Muestreo 5`/Longitud *1000,1)) %>%
+# ungroup para que se deshaga de Transecta porque viene de agrupar  
+  ungroup()%>%
+# me quedo solo con las densidades
+    select(8:12)
+  
+
+
+```
+
+Índice de razón por ocasión: perros contados / km recorridos. Es el índice que se usa para el seguimiento
+(con transectas fijas coincide con el efecto de ocasión del modelo dentro de transecta).
+
+```{r indice_razon}
+Ush_indice_razon_2024 <- Ushuaia_conteo_km_2024 %>%
+  summarise(across(starts_with("Muestreo"), sum), Km = sum(Longitud) / 1000) %>%  # Longitud en metros
+  pivot_longer(starts_with("Muestreo"), names_to = "Ocasión", values_to = "Perros") %>%
+  mutate(Ocasión = str_replace(Ocasión, "Muestreo", "Ocasión"),
+         Indice  = Perros / Km) %>%
+  relocate(Ocasión, Perros, Km, Indice)
+
+# índice de la campaña: la misma razón con todas las ocasiones juntas
+Ush_campania_2024 <- Ush_indice_razon_2024 %>%
+  summarise(Ocasión = "Campaña (todas las ocasiones)",
+            Perros = sum(Perros), Km = sum(Km), Indice = sum(Perros) / sum(Km))
+
+Ush_densidades_2024 <- bind_rows(Ush_indice_razon_2024, Ush_campania_2024)
+
+# variación entre ocasiones: desvío estándar del logaritmo del índice (aproxima el CV)
+cv_entre_ocasiones <- sd(log(Ush_indice_razon_2024$Indice))
+
+print(Ush_densidades_2024)
+cat("Variación entre ocasiones (CV aprox.):", round(100 * cv_entre_ocasiones, 1), "%\n")
+
+# exporta con coma decimal
+Ush_densidades_2024 %>%
+  mutate(across(c(Km, Indice), ~ formatC(.x, format = "f", digits = 2, decimal.mark = ","))) %>%
+  write_delim("Ush_densidades_2024.txt", delim = "\t")
+```
+
+Descripción de la heterogeneidad entre transectas: media y desvío estándar de la densidad por transecta en cada ocasión (no es el índice de seguimiento)
+
+
+```{r}
+Ushuaia_estadisticas_indice_2024 <- Ushuaia_Densidad_2024 %>%
+  summarise(across(everything(), list(media = mean, sd = sd))) %>%
+  mutate(across(everything(), ~ round(.x, 1)))
+
+write_csv2(Ushuaia_estadisticas_indice_2024, "Ushuaia_estadisticas_indice_2024.csv")
+
+print(Ushuaia_estadisticas_indice_2024)
+
+# hacer una tabla con medias +- desvios
+
+# primero tabla con medias
+Ush_Medias_2024 <- Ushuaia_estadisticas_indice_2024 %>%
+  select(1,3,5,7,9)  %>%
+  pivot_longer(cols=c(1:5),names_to="Ocasion", values_to="densidad_media") %>%
+  mutate(dummy = row_number())
+
+# luego tabla con desvíos
+Ush_DE_2024 <- Ushuaia_estadisticas_indice_2024 %>%
+  select(2,4,6,8,10)  %>%
+  pivot_longer(cols=c(1:5),names_to="Ocasion", values_to="densidad_de") %>%
+  mutate(dummy = row_number())
+
+# Fabricar table con medias y desvios
+Ush_heterogeneidad_2024 <- Ush_Medias_2024 %>%
+  left_join(Ush_DE_2024, by="dummy") %>%
+#  Agrega campo con Ocasion y numero 
+  mutate(Ocasión = paste0("Ocasión ", row_number())) %>%
+# crea campo de texto con media ± desvio (un decimal fijo)
+    mutate(mediade = sprintf("%.1f ± %.1f", densidad_media, densidad_de)) %>%
+# reemplaza punto por coma
+    mutate(across(everything(), 
+                  ~ str_replace_all(.x, "\\.", ","))) %>%
+  # me quedo solo con ocasiones y desvíos
+  select (6,7)
+
+write_delim(Ush_heterogeneidad_2024, "Ush_heterogeneidad_2024.txt", delim = "\t")
+
+
+```
+
+
+Tablas elegantes del índice de razón por ocasión. Se usan los paquetes `gt` (para el documento HTML)
+y `flextable` (para Word); se instalan una vez con `install.packages(c("gt", "flextable"))`.
+
+```{r tabla_densidades}
+library(gt)
+
+n_transectas  <- nrow(Ushuaia_conteo_km_2024)   # transectas, las mismas en cada ocasión
+fila_campania <- nrow(Ush_densidades_2024)       # última fila: índice de la campaña
+cv_txt  <- formatC(100 * cv_entre_ocasiones, format = "f", digits = 1, decimal.mark = ",")
+nota_1  <- paste0("Índice = perros contados / km recorridos; los avistajes sin foto cuentan como perro visto. n = ",
+                  n_transectas, " transectas, las mismas en cada ocasión.")
+nota_2  <- paste0("Variación entre ocasiones: CV aprox. ", cv_txt, " % (desvío estándar del logaritmo del índice, ",
+                  nrow(Ush_indice_razon_2024) - 1, " grados de libertad).")
+
+tabla_densidades_2024 <- Ush_densidades_2024 %>%
+  gt() %>%
+  tab_header(
+    title    = md("**Índice de densidad de perros sueltos por ocasión**"),
+    subtitle = "Ushuaia, 2024 · perros contados por km recorrido"
+  ) %>%
+  cols_label(Perros = "Perros contados", Km = "Km recorridos", Indice = "Índice (perros/km)") %>%
+  fmt_integer(columns = Perros, sep_mark = ".") %>%
+  fmt_number(columns = c(Km, Indice), decimals = 2, dec_mark = ",", sep_mark = ".") %>%
+  cols_align(align = "left",   columns = Ocasión) %>%
+  cols_align(align = "center", columns = c(Perros, Km, Indice)) %>%
+  tab_style(style = list(cell_text(weight = "bold"), cell_fill(color = "#EEF4FA")),
+            locations = cells_body(rows = fila_campania)) %>%
+  tab_style(style = cell_borders(sides = "top", color = "#08306B", weight = px(1.5)),
+            locations = cells_body(rows = fila_campania)) %>%
+  tab_source_note(nota_1) %>%
+  tab_source_note(nota_2) %>%
+  opt_row_striping() %>%
+  tab_options(
+    table.font.names = "Arial", table.font.size = px(14),
+    heading.align = "left", heading.title.font.size = px(18),
+    heading.subtitle.font.size = px(13),
+    column_labels.font.weight = "bold", column_labels.background.color = "#DCE6F2",
+    column_labels.border.bottom.color = "#08306B",
+    table.border.top.color = "#08306B", table.border.top.width = px(2),
+    table.border.bottom.color = "#08306B", table.border.bottom.width = px(2),
+    data_row.padding = px(6)
+  )
+
+# se muestra en el documento
+tabla_densidades_2024
+
+# la misma tabla como página web independiente
+gtsave(tabla_densidades_2024, "Ush_densidades_2024.html")
+```
+
+Versión para pegar en un informe de Word
+
+```{r tabla_word}
+library(flextable)
+
+ft_densidades_2024 <- Ush_densidades_2024 %>%
+  flextable() %>%
+  set_header_labels(Perros = "Perros contados", Km = "Km recorridos", Indice = "Índice (perros/km)") %>%
+  colformat_double(j = c("Km", "Indice"), digits = 2, big.mark = ".", decimal.mark = ",") %>%
+  colformat_double(j = "Perros", digits = 0, big.mark = ".", decimal.mark = ",") %>%
+  add_header_lines("Índice de densidad de perros sueltos por ocasión. Ushuaia, 2024 (perros contados por km recorrido)") %>%
+  add_footer_lines(c(nota_1, nota_2)) %>%
+  theme_booktabs() %>%
+  font(fontname = "Arial", part = "all") %>%
+  fontsize(size = 10.5, part = "all") %>%
+  bg(part = "header", bg = "#DCE6F2") %>%
+  bold(part = "header") %>%
+  bold(i = fila_campania, part = "body") %>%
+  bg(i = fila_campania, bg = "#EEF4FA", part = "body") %>%
+  align(j = c("Perros", "Km", "Indice"), align = "center", part = "all") %>%
+  align(i = 1, align = "left", part = "header") %>%
+  width(j = "Ocasión", width = 2.2) %>%
+  width(j = c("Perros", "Km", "Indice"), width = 1.3)
+
+save_as_docx(ft_densidades_2024, path = "Ush_densidades_2024.docx")
+```
