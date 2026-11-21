@@ -1,0 +1,388 @@
+---
+title: "Perros sueltos en Ushuaia: estimación de abundancia"
+subtitle: "Modelos de captura cerrada con heterogeneidad individual (RMark / Program MARK)"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4, dpi = 150)
+options(stringsAsFactors = FALSE)
+```
+
+# Qué hace este documento
+
+Ajusta modelos de población cerrada a las historias de detección fotográfica de perros
+sueltos, comparando modelos **sin heterogeneidad** (M0, Mt) contra modelos de **mezcla
+finita de Pledger** (Mh, Mth), que permiten que unos perros sean sistemáticamente más
+detectables que otros.
+
+El punto crítico del análisis es el tratamiento de los registros `SF` (perro avistado pero
+no identificado). Se explica en la sección 3.
+
+## Requisitos
+
+`RMark` es una interfaz: **necesita que Program MARK esté instalado** y que `mark.exe` sea
+accesible. MARK se descarga gratis desde <http://www.phidot.org/software/mark/>.
+
+```{r requisitos}
+tiene_rmark <- requireNamespace("RMark", quietly = TRUE)
+if (tiene_rmark) suppressPackageStartupMessages(library(RMark))
+
+# MARK se instala como mark32.exe / mark64.exe, NO como mark.exe, y normalmente no
+# queda en el PATH de Windows. RMark trae su propia búsqueda, create_markpath(),
+# que contempla los tres nombres, mira c:/Program Files/Mark y (x86), y en R de
+# 64 bits prefiere mark64.exe. Se la usa a ella en vez de reimplementarla.
+ruta_mark <- NULL
+if (tiene_rmark) {
+  ruta_mark <- tryCatch(RMark:::create_markpath(), error = function(e) NULL)
+  if (is.null(ruta_mark)) {                 # respaldo manual
+    for (d in c("C:/Program Files (x86)/MARK", "C:/Program Files/MARK", "C:/MARK")) {
+      hit <- file.path(d, c("mark64.exe", "mark32.exe", "mark.exe"))
+      hit <- hit[file.exists(hit)]
+      if (length(hit)) { ruta_mark <- shQuote(hit[1]); MarkPath <- d; break }
+    }
+  }
+}
+tiene_mark <- !is.null(ruta_mark)
+
+cat("RMark disponible:", tiene_rmark, "\n")
+cat("ejecutable de MARK:", if (tiene_mark) ruta_mark else "NO ENCONTRADO", "\n")
+if (!tiene_mark) {
+  cat("\nLos chunks de modelado se saltean. Si MARK está instalado en otra carpeta,",
+      "indicarla a mano antes de seguir:\n",
+      '   MarkPath <- "C:/ruta/a/la/carpeta/de/MARK"\n',
+      "   tiene_mark <- TRUE\n")
+}
+```
+
+# Lectura de los datos
+
+El archivo usa `;` como separador. Las columnas de ocasión son `Muestreo 1` a `Muestreo 5`.
+
+```{r lectura}
+archivo <- "Historia Ushuaia cruda.csv"   # ajustar la ruta si hace falta
+
+crudo <- read.csv(archivo, sep = ";", header = TRUE, check.names = FALSE,
+                  colClasses = "character", fileEncoding = "UTF-8-BOM")
+names(crudo) <- trimws(names(crudo))
+
+col_occ <- grep("^Muestreo", names(crudo), value = TRUE)
+K <- length(col_occ)
+
+cat("filas:", nrow(crudo), "| transectas:", length(unique(crudo$Transecta)),
+    "| ocasiones:", K, "\n")
+cat("valores presentes en las celdas:",
+    paste(sort(unique(trimws(toupper(unlist(crudo[col_occ]))))), collapse = ", "), "\n")
+```
+
+# Limpieza: el tratamiento de los `SF`
+
+Un `SF` es un perro **avistado pero no identificado**. Eso tiene dos consecuencias distintas
+según dónde aparezca:
+
+1. **Filas que sólo contienen `SF`.** No son perros confirmados, son avistamientos
+   sin vínculo con ningún individuo conocido. Si se las deja en la tabla, el modelo
+   las lee como perros vistos exactamente una vez y **infla la estimación**.
+   Hay que eliminarlas.
+2. **Filas que mezclan `1` y `SF`.** El perro sí está identificado; en esa ocasión
+   particular no se lo pudo confirmar. El `SF` pasa a `0` (no detectado).
+
+El `SF` **no es dato faltante recuperable**: ni la captura-recaptura ni el reavistaje
+pueden usarlo, porque no se sabe a qué individuo corresponde.
+
+```{r limpieza}
+M    <- trimws(toupper(as.matrix(crudo[col_occ])))
+unos <- M == "1"
+sfs  <- M == "SF"
+
+fila_con_uno <- apply(unos, 1, any)
+fila_con_sf  <- apply(sfs,  1, any)
+
+resumen_sf <- data.frame(
+  concepto = c("avistamientos identificados (1)",
+               "avistamientos no identificados (SF)",
+               "filas sólo-SF (se eliminan)",
+               "filas que mezclan 1 y SF (el SF pasa a 0)",
+               "perros identificados que quedan"),
+  n = c(sum(unos), sum(sfs),
+        sum(fila_con_sf & !fila_con_uno),
+        sum(fila_con_sf &  fila_con_uno),
+        sum(fila_con_uno))
+)
+knitr::kable(resumen_sf, caption = "Tratamiento de los registros SF")
+
+pct_sf <- 100 * sum(sfs) / (sum(unos) + sum(sfs))
+cat(sprintf("\nLos SF son el %.1f %% de los avistamientos.\n", pct_sf))
+```
+
+# Construcción de las historias de detección
+
+RMark espera un `data.frame` con una columna `ch`: una cadena de 0 y 1, un carácter por
+ocasión. `freq` queda implícito en 1 por fila.
+
+```{r historias}
+unos_ok <- unos[fila_con_uno, , drop = FALSE]     # los SF ya quedan como FALSE = 0
+perros  <- data.frame(
+  ch        = apply(unos_ok, 1, function(r) paste0(as.integer(r), collapse = "")),
+  Transecta = crudo$Transecta[fila_con_uno]
+)
+
+S <- nrow(perros)
+veces <- rowSums(unos_ok)
+tabla_frec <- as.data.frame(table(`veces reconocido` = veces))
+
+cat("perros (historias):", S, "| avistamientos:", sum(veces), "\n")
+knitr::kable(tabla_frec, caption = "Cuántas veces fue reconocido cada perro")
+head(perros, 4)
+```
+
+```{r grafico-frecuencias, fig.cap="Distribución del número de veces que cada perro fue reconocido."}
+barplot(table(veces), col = "#0072B2", border = "#3A3A3A",
+              xlab = "Veces que el perro fue reconocido", ylab = "Perros",
+              main = "")
+```
+
+> Una cola tan cargada en el 1 es la firma de heterogeneidad individual fuerte. Si todos los
+> perros tuvieran la misma probabilidad de detección, la clase modal no sería la de "visto
+> una sola vez". Esto es lo que justifica incluir modelos de mezcla.
+
+# Exportación para la interfaz gráfica de MARK
+
+Por si se prefiere trabajar en MARK directamente, sin R.
+
+```{NO  CORRER r exportar, eval=tiene_rmark}
+RMark::export.chdata(perros, filename = "ushuaia_perros", replace = TRUE)
+cat("escrito: ushuaia_perros.inp\n")
+```
+
+# Ajuste de los modelos
+
+## Especificación
+
+Siguiendo la sintaxis del ejemplo `edwards.eberhardt` que acompaña a RMark:
+
+| Modelo | `model=` | fórmula de `p` | Qué supone |
+|---|---|---|---|
+| M0 | `Closed` | `~1`, `share=TRUE` | todos los perros iguales, sin efecto de ocasión |
+| Mt | `Closed` | `~time`, `share=TRUE` | todos iguales, la detección varía entre muestreos |
+| Mh2 | `HetClosed` | `~mixture` | dos tipos de perro, detección constante en el tiempo |
+| Mth2 | `FullHet` | `~time + mixture`, `share=TRUE` | dos tipos de perro y efecto de muestreo |
+| Mh3 | `HetClosed` + `mixtures=3` | `~mixture` | tres tipos de perro |
+
+`share = TRUE` fuerza `p = c`, es decir que ver a un perro no cambia la probabilidad de
+volver a verlo. Con fotografía a distancia es el supuesto razonable; con trampeo habría que
+revisarlo.
+
+`retry` reintenta desde otros valores iniciales. **Es importante acá**: los modelos de
+mezcla tienen varios máximos locales, y sin reintentos se puede converger a una solución
+equivocada.
+
+```{r modelos, eval=tiene_mark, results='hide'}
+pdotshared         <- list(formula = ~1,             share = TRUE)
+ptimeshared        <- list(formula = ~time,          share = TRUE)
+pmixture           <- list(formula = ~mixture)
+ptimemixtureshared <- list(formula = ~time + mixture, share = TRUE)
+
+m_M0 <- mark(perros, model = "Closed",
+             model.parameters = list(p = pdotshared),
+             delete = TRUE, silent = TRUE, output = FALSE)
+
+m_Mt <- mark(perros, model = "Closed",
+             model.parameters = list(p = ptimeshared),
+             delete = TRUE, silent = TRUE, output = FALSE)
+
+m_Mh2 <- mark(perros, model = "HetClosed",
+              model.parameters = list(p = pmixture),
+              retry = 3, delete = TRUE, silent = TRUE, output = FALSE)
+
+m_Mth2 <- mark(perros, model = "FullHet",
+               model.parameters = list(p = ptimemixtureshared),
+               adjust = TRUE, retry = 3, delete = TRUE, silent = TRUE, output = FALSE)
+
+m_Mh3 <- mark(perros, model = "HetClosed", mixtures = 3,
+              model.parameters = list(p = pmixture),
+              retry = 5, delete = TRUE, silent = TRUE, output = FALSE)
+```
+
+## Comparación por AICc
+
+```{r tabla-modelos, eval=tiene_mark}
+modelos <- collect.models(lx = c("m_M0", "m_Mt", "m_Mh2", "m_Mth2", "m_Mh3"))
+knitr::kable(modelos$model.table, digits = 2,
+             caption = "Selección de modelos por AICc")
+```
+
+## Abundancia estimada
+
+En los modelos de verosimilitud completa (`Closed`, `HetClosed`, `FullHet`) la abundancia es
+un parámetro derivado: N = perros vistos + f0, donde f0 son los nunca vistos.
+
+```{r abundancia, eval=tiene_mark}
+tomar_N <- function(m, nombre) {
+  d <- try(m$results$derived[[1]], silent = TRUE)
+  if (inherits(d, "try-error") || is.null(d)) return(NULL)
+  data.frame(modelo = nombre, N = d$estimate, se = d$se, lcl = d$lcl, ucl = d$ucl)
+}
+abund <- do.call(rbind, list(
+  tomar_N(m_M0, "M0"), tomar_N(m_Mt, "Mt"), tomar_N(m_Mh2, "Mh2"),
+  tomar_N(m_Mth2, "Mth2"), tomar_N(m_Mh3, "Mh3")))
+knitr::kable(abund, digits = 1, row.names = FALSE,
+             caption = "Abundancia estimada con intervalo de confianza del 95 %")
+```
+
+```{r grafico-abundancia, eval=tiene_mark, fig.cap="Abundancia estimada por modelo. La línea punteada marca los perros efectivamente reconocidos, que es un piso."}
+o <- order(abund$N)
+plot(abund$N[o], seq_len(nrow(abund)), xlim = range(c(S, abund$lcl, abund$ucl), na.rm = TRUE),
+     pch = 19, col = "#0072B2", yaxt = "n", ylab = "", xlab = "Perros estimados")
+segments(abund$lcl[o], seq_len(nrow(abund)), abund$ucl[o], seq_len(nrow(abund)), col = "#0072B2")
+axis(2, at = seq_len(nrow(abund)), labels = abund$modelo[o], las = 1)
+abline(v = S, lty = 3, col = "#3A3A3A")
+```
+
+## Parámetros del modelo de mezcla
+
+```{r parametros, eval=tiene_mark}
+reales <- m_Mh2$results$real[, c("estimate", "se", "lcl", "ucl")]
+knitr::kable(reales, digits = 3,
+             caption = "pi = proporción del primer grupo; p = detección de cada grupo")
+```
+
+## Bondad de ajuste
+
+Compara la distribución observada de "veces reconocido" contra la que predice el modelo.
+
+```{r bondad, eval=tiene_mark}
+ajuste <- try({
+  re  <- m_Mh2$results$real
+  pi1 <- re$estimate[grep("^pi", rownames(re))][1]
+  # "^p(?!i)" evita que el parámetro pi entre como si fuera una p
+  ps  <- re$estimate[grep("^p(?!i)", rownames(re), perl = TRUE)][1:2]
+  obs <- as.integer(table(factor(veces, levels = 1:K)))
+
+  # El orden en que MARK indexa las mezclas no se deduce de los nombres de fila:
+  # pi puede corresponder al grupo de p alta o al de p baja. Se prueban los dos
+  # apareamientos y se usa el consistente con los datos.
+  esperado_de <- function(w) {
+    pmf <- rowSums(sapply(1:2, function(g) w[g] * dbinom(0:K, K, ps[g])))
+    S * pmf[-1] / sum(pmf[-1])
+  }
+  opciones <- list(c(pi1, 1 - pi1), c(1 - pi1, pi1))
+  chi2 <- sapply(opciones, function(w) sum((obs - esperado_de(w))^2 / esperado_de(w)))
+  k_ok <- which.min(chi2)
+  w_ok <- opciones[[k_ok]]
+
+  list(tabla = data.frame(veces = 1:K, observado = obs,
+                          esperado = round(esperado_de(w_ok), 1)),
+       chi2 = chi2[k_ok], chi2_alt = chi2[-k_ok],
+       texto = sprintf("pi = %.3f apareado con p = %.3f ; pi = %.3f con p = %.3f",
+                       w_ok[1], ps[1], w_ok[2], ps[2]))
+}, silent = TRUE)
+
+if (inherits(ajuste, "try-error")) {
+  cat("No se pudieron extraer los parámetros reales;",
+      "revisar rownames(m_Mh2$results$real).\n")
+} else {
+  knitr::kable(ajuste$tabla, row.names = FALSE,
+               caption = "Observado contra esperado bajo Mh2")
+  cat(sprintf("chi-cuadrado de ajuste = %.1f\n", ajuste$chi2))
+  cat(sprintf("%s\n", ajuste$texto))
+  cat(sprintf("(el apareamiento inverso daba chi-cuadrado = %.1f)\n", ajuste$chi2_alt))
+}
+```
+
+# Sensibilidad al tratamiento de los `SF`
+
+La sección 3 descartó los avistamientos no identificados. Esa decisión tiene consecuencias
+distintas según **por qué** falló la identificación, y la tabla de datos no permite
+distinguirlo. Esta sección calcula las dos cotas.
+
+**Cota A — los `SF` son fallas de foto al azar.** Mal ángulo, el perro cruzó rápido,
+contraluz. Descartarlos **no introduce sesgo**: lo que el modelo estima pasa a ser la
+probabilidad de ser *identificado* en vez de la de ser *detectado*, y como `S` también
+cuenta perros identificados, el cociente `N = S / p*` sigue siendo correcto. La falla se
+absorbe en el parámetro y se cancela.
+
+**Cota B — los `SF` son perros que nunca se pueden identificar.** Pelaje liso sin marcas,
+perros esquivos. Esos perros jamás entran al archivo, así que la estimación corresponde
+sólo a la subpoblación identificable. Suponiendo que se detecten igual que el resto, la
+razón entre sus avistamientos y los identificados escala la abundancia.
+
+```{r sensibilidad-sf, eval=tiene_mark}
+n_ident <- sum(unos)                    # avistamientos identificados
+n_sf    <- sum(sfs)                     # avistamientos no identificados
+delta   <- n_ident / (n_ident + n_sf)   # tasa de identificación
+
+# N de referencia: el del modelo que se quiera reportar (acá Mh2)
+N_A <- tryCatch(m_Mh2$results$derived[[1]]$estimate, error = function(e) NA_real_)
+N_B <- N_A * (1 + n_sf / n_ident)
+
+cotas <- data.frame(
+  supuesto = c("A. los SF son fallas de foto al azar",
+               "B. los SF son perros nunca identificables"),
+  N = round(c(N_A, N_B), 0),
+  comentario = c("la estimación del modelo es insesgada",
+                 sprintf("escalada por %d/%d = %.3f", n_sf, n_ident, n_sf / n_ident))
+)
+knitr::kable(cotas, row.names = FALSE,
+             caption = sprintf("Cotas por el tratamiento de los SF (tasa de identificación = %.3f)",
+                               delta))
+cat(sprintf("\nRango: %.0f a %.0f  (+%.1f %%)\n", N_A, N_B, 100 * (N_B - N_A) / N_A))
+
+# Las p del modelo son de IDENTIFICACIÓN, no de detección. Bajo la cota A:
+p_id <- tryCatch(sort(m_Mh2$results$real$estimate[
+                        grep("^p(?!i)", rownames(m_Mh2$results$real), perl = TRUE)][1:2]),
+                 error = function(e) NULL)
+if (!is.null(p_id) && all(is.finite(p_id))) {
+  cat(sprintf("p de identificación: %.3f / %.3f  ->  p de detección real: %.3f / %.3f\n",
+              p_id[1], p_id[2], p_id[1] / delta, p_id[2] / delta))
+}
+```
+
+> **Cómo leer este rango.** Es la menor de las incertidumbres del análisis. Entre modelos la
+> abundancia va de unos 740 (Mt) a 1.320 (Mh2), y la variante de tres mezclas se dispara
+> mucho más. La elección de modelo pesa bastante más que el tratamiento de los `SF`.
+>
+> **Cómo hacerlo desaparecer.** Partir el código `SF` en dos: *"no se pudo fotografiar"* y
+> *"fotografiado pero sin marcas distinguibles"*. Sólo el segundo alimenta la cota B. Con esa
+> distinción registrada, el rango colapsa a un número.
+
+```{r limpieza-final, eval=tiene_mark, include=FALSE}
+cleanup(ask = FALSE)
+```
+
+# Advertencias de interpretación
+
+1. **Las 47 transectas se tratan como una sola población.** Los identificadores de perro
+   se reinician en cada transecta, así que un perro que se mueva entre tramos cuenta dos
+   veces. Con 600 m de separación el problema es acotado, pero la estimación conjunta
+   supone algo que los datos no verifican. Para tratarlas por separado:
+   `process.data(perros, model = "HetClosed", groups = "Transecta")`, aunque con una mediana
+   de 9 perros por transecta la mayoría no tendrá datos suficientes.
+
+2. **Los modelos de mezcla no acotan N por arriba.** Un grupo de perros que nunca sale
+   cuando pasa el observador es indistinguible de un grupo que no existe. Si `Mh3` devuelve
+   una abundancia desmesurada con un grupo de `p` cercano a cero, es este fenómeno y no un
+   resultado biológico. Mirar el AICc antes de creerle.
+
+3. **No se testeó respuesta conductual** (modelos Mb, Mbh). Para agregarla, quitar
+   `share = TRUE` o usar la fórmula `~time + c`.
+
+4. **La heterogeneidad se modela como grupos latentes.** Si se registrara una covariable
+   observable que separe perro callejero de perro con dueño (collar, condición corporal),
+   convendría usarla directamente con el tipo de datos `Huggins`, que admite covariables
+   individuales. Es preferible a inferir los grupos.
+
+5. **Alternativa con distribución continua:** el tipo de datos `HugginsRE` modela la
+   heterogeneidad con un efecto aleatorio en vez de grupos discretos. Vale como contraste
+   si se sospecha que la detectabilidad es un gradiente.
+
+```{r info-sesion}
+sessionInfo()
+```
