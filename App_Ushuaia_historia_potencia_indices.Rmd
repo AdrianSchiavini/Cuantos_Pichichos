@@ -1,0 +1,360 @@
+---
+title: "Potencia de tendencia desde la historia de detección: índice de perros en transectas permanentes"
+subtitle: "Ushuaia · conteos por transecta y ocasión"
+output: html_document
+runtime: shiny
+editor_options:
+  chunk_output_type: inline
+---
+
+La app parte de la **historia de detección** (`Historia Ushuaia cruda.csv`: una fila por
+perro y transecta, con 1, 0 o SF en cada ocasión) y permite cambiar tres decisiones del
+monitoreo: **cuántas ocasiones** se hacen por año, **cada cuántos años** se repite el
+relevamiento y **cuántos años** se evalúa el cambio.
+
+**Supuestos que usa la app.**
+
+- **Transectas permanentes.** Son siempre las mismas y los perros no pasan de una a otra.
+  La variación entre transectas es común a todas las campañas y no entra en la potencia de
+  la tendencia; sí entra en la cifra absoluta de la ciudad.
+- **Ocasiones cercanas en el tiempo.** Los conteos dentro de un año se hacen con intervalos
+  tan cortos que la variabilidad entre momentos no se puede despreciar. Por eso esa
+  variabilidad se trata como un componente **compartido** por las ocasiones del mismo año:
+  no se promedia al agregar ocasiones. Podés cambiar este supuesto en el control
+  correspondiente.
+
+**Para usarla:** abrir en RStudio y apretar **"Run Document"** (no "Knit"). Necesita
+`shiny` y `ggplot2`. La historia se carga con el botón de arriba; por defecto se busca
+`Historia Ushuaia cruda.csv` en la carpeta del documento. Si existe
+`Ushuaia_completo_indice_2024.csv` en la misma carpeta, se usan de ahí las longitudes de
+los tramos; si no, cargalas aparte.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(shiny)
+library(ggplot2)
+
+HIST_DEF   <- "Historia Ushuaia cruda.csv"
+LARGO_DEF  <- "Ushuaia_completo_indice_2024.csv"
+```
+
+```{r estilo}
+tags$style(HTML("
+  .shiny-input-container .control-label { font-size: 10px; font-weight: 600; margin-bottom: 0px; }
+  .irs, .irs-min, .irs-max, .irs-single, .irs-from, .irs-to { font-size: 10px; }
+  .irs--shiny .irs-min, .irs--shiny .irs-max, .irs--shiny .irs-single,
+  .irs--shiny .irs-from, .irs--shiny .irs-to { font-size: 10px; }
+  .irs--shiny .irs-grid-text { font-size: 9px; }
+  .help-block { font-size: 10px; margin: 0; }
+  .btn { font-size: 12px; padding: 4px 8px; }
+  h1.title { font-size: 20px; } h1 { font-size: 18px; } h2 { font-size: 15px; } h3 { font-size: 13px; }
+  p, li { font-size: 12px; }
+  .form-group { margin-bottom: 2px; }
+  .shiny-input-container { margin-bottom: 2px; }
+  [class*='col-'] { padding-left: 6px; padding-right: 6px; }
+  .row { margin-left: -6px; margin-right: -6px; }
+"))
+```
+
+## 1. Lectura y componentes
+
+```{r funciones}
+# ---- lectura de la historia de detección ----------------------------------
+# Cada fila es un perro en una transecta; cada columna Muestreo k es una ocasión.
+# Cuenta como perro visto el 1 y el SF (avistaje sin foto), igual que en el
+# índice por conteo. Devuelve la matriz transecta x ocasión de conteos.
+leer_historia <- function(path) {
+  h <- read.csv2(path, check.names = FALSE, stringsAsFactors = FALSE, colClasses = "character")
+  mc <- grep("^Muestreo", names(h), value = TRUE)
+  if (!("Transecta" %in% names(h)) || length(mc) < 2)
+    stop("La historia necesita una columna Transecta y al menos dos columnas Muestreo.")
+  v   <- as.matrix(h[, mc])
+  sf  <- toupper(trimws(v)) == "SF"
+  det <- ((trimws(v) == "1") | sf) * 1L
+  det[is.na(det)] <- 0L
+  tr  <- as.integer(h$Transecta)
+  cnt <- rowsum(det, tr, reorder = TRUE)
+  list(cnt = cnt, transectas = as.integer(rownames(cnt)), K = length(mc),
+       filas = nrow(h), sf_total = sum(sf, na.rm = TRUE),
+       sf_por_ocasion = colSums(sf, na.rm = TRUE))
+}
+
+# ---- longitudes de los tramos (opcional) ----------------------------------
+# Devuelve data.frame(transecta, km). Si los valores están en metros se pasan a km.
+leer_longitudes <- function(path) {
+  w <- read.csv2(path, check.names = FALSE, stringsAsFactors = FALSE)
+  iT <- grep("transecta|tramo", names(w), ignore.case = TRUE)[1]
+  iL <- grep("longitud|largo|km", names(w), ignore.case = TRUE)[1]
+  if (is.na(iT) || is.na(iL)) stop("El archivo de longitudes necesita Transecta y Longitud.")
+  km <- as.numeric(sub(",", ".", w[[iL]]))
+  if (max(km, na.rm = TRUE) > 50) km <- km / 1000
+  data.frame(transecta = as.integer(w[[iT]]), km = km)
+}
+
+# ---- panel en formato largo para las ocasiones elegidas -------------------
+panel_largo <- function(H, km_tr, sel) {
+  ok <- !is.na(km_tr)
+  do.call(rbind, lapply(sel, function(j)
+    data.frame(pasada = j, transecta = H$transectas[ok], km = km_tr[ok],
+               conteo = H$cnt[ok, j])))
+}
+
+# ---- componentes de variación del panel (mismo estimador que el script) ----
+descomponer_anio <- function(x) {
+  x$pasada    <- factor(x$pasada)
+  x$transecta <- factor(x$transecta)
+  J <- nlevels(x$pasada)
+  if (J < 2) stop("Hacen falta al menos dos pasadas por año.")
+
+  # Esperado por tramo sin efecto de pasada (el tramo absorbe el promedio).
+  fit0 <- glm(conteo ~ transecta, family = poisson, offset = log(km), data = x)
+  e    <- fitted(fit0)
+
+  # Estimador de razón por pasada, en log: es la misma cantidad que entra en
+  # el índice anual (suma de conteos / suma de km), así que el piso y los
+  # componentes se miden en la misma escala.
+  num <- tapply(x$conteo, x$pasada, sum)
+  den <- tapply(e, x$pasada, sum)
+  r   <- log(num / den)
+  var_tot <- var(r)
+
+  # Sobredispersión (binomial negativa) por momentos, con los residuos
+  # corregidos por apalancamiento del tramo.
+  h0    <- pmin(hatvalues(fit0), 0.95)
+  theta <- sum(e^2) / max(1e-6, sum((x$conteo - e)^2 / (1 - h0) - e))
+
+  # Referencia nula: si no hubiera variación entre pasadas, el mismo
+  # estadístico var(log(num_j/den_j)) se simula desde el ajuste. Su valor
+  # esperado es el error de conteo "visto por el estimador", y se resta.
+  B_ref <- 300
+  r_nulo <- replicate(B_ref, {
+    ys <- if (is.finite(theta)) rnbinom(length(e), mu = e, size = theta)
+          else rpois(length(e), e)
+    var(log(tapply(ys, x$pasada, sum) / den))
+  })
+  var_cont <- mean(r_nulo)
+
+  list(J = J, var_cont = var_cont, var_tot = var_tot,
+       var_pasada = max(0, var_tot - var_cont),
+       dispersion = sum((x$conteo - e)^2 / e) / (nrow(x) - length(coef(fit0))))
+}
+
+# Componentes para el panel: error de conteo por ocasión y variación entre ocasiones.
+componentes_panel_app <- function(dl) {
+  d <- suppressWarnings(descomponer_anio(dl))
+  list(cv_conteo = sqrt(d$var_cont), cv_pasada = sqrt(d$var_pasada),
+       J = d$J, k0 = length(unique(dl$transecta)),
+       km0 = sum(dl$km[dl$pasada == min(dl$pasada)]),
+       dispersion = d$dispersion)
+}
+
+# ---- CV de una campaña de m ocasiones con k tramos -------------------------
+# compartido = TRUE  : las ocasiones del año son cercanas en el tiempo; el componente
+#                      entre momentos es común a todas y no se promedia.
+# compartido = FALSE : las ocasiones están separadas en el tiempo; el componente
+#                      entre momentos se promedia como el error de conteo.
+cv_campania_app <- function(c0, k, m, piso, compartido) {
+  if (compartido)
+    sqrt(piso^2 + c0$cv_pasada^2 + c0$cv_conteo^2 * c0$k0 / (k * m))
+  else
+    sqrt(piso^2 + (c0$cv_conteo^2 * c0$k0 / k + c0$cv_pasada^2) / m)
+}
+
+anios_a_n <- function(anios, tau) pmax(floor(anios / tau) + 1, 2)
+cambio_minimo_detectable <- function(n, CV, tau = 1, alpha = 0.05, power = 0.80) {
+  z <- qnorm(1 - alpha / 2) + qnorm(power)
+  (exp(z * CV / (tau * sqrt(n * (n^2 - 1) / 12))) - 1) * 100
+}
+potencia_tendencia <- function(n, CV, tau, cambio_anual_pct, alpha = 0.05) {
+  r  <- log(1 + cambio_anual_pct / 100)
+  ee <- CV / (tau * sqrt(n * (n^2 - 1) / 12))
+  za <- qnorm(1 - alpha / 2)
+  pnorm(abs(r) / ee - za) + pnorm(-abs(r) / ee - za)
+}
+cambio_total_pct <- function(cambio_anual_pct, anios)
+  ((1 + cambio_anual_pct / 100)^anios - 1) * 100
+```
+
+## 2. Datos y controles
+
+```{r datos}
+fluidRow(
+  column(4, fileInput("hist", "Historia de detección (CSV):", accept = c(".csv", ".txt"),
+                      buttonLabel = "Buscar...", placeholder = HIST_DEF)),
+  column(4, fileInput("largos", "Longitudes de tramos (opcional):", accept = c(".csv", ".txt"),
+                      buttonLabel = "Buscar...", placeholder = LARGO_DEF)),
+  column(4, helpText("Si no hay longitudes, cada tramo cuenta como 1 km y el índice es conteo por tramo, no densidad."))
+)
+
+H <- reactive({
+  p <- if (!is.null(input$hist)) input$hist$datapath else HIST_DEF
+  validate(need(file.exists(p), "Cargá la historia de detección (CSV)."))
+  leer_historia(p)
+})
+
+L <- reactive({
+  p <- if (!is.null(input$largos)) input$largos$datapath
+       else if (file.exists(LARGO_DEF)) LARGO_DEF else NULL
+  if (is.null(p)) NULL else leer_longitudes(p)
+})
+
+output$ui_ocas <- renderUI({
+  h <- H()
+  checkboxGroupInput("ocas", "Ocasiones de la historia que entran en la estimación:",
+                     choices = setNames(seq_len(h$K), paste("Ocasión", seq_len(h$K))),
+                     selected = seq_len(h$K), inline = TRUE)
+})
+
+dl <- reactive({
+  h   <- H()
+  sel <- as.integer(input$ocas)
+  validate(need(length(sel) >= 2, "Elegí al menos dos ocasiones para estimar la variación."))
+  km_tr <- rep(1, length(h$transectas))
+  if (!is.null(L())) km_tr <- L()$km[match(h$transectas, L()$transecta)]
+  panel_largo(h, km_tr, sel)
+})
+
+cc <- reactive(componentes_panel_app(dl()))
+```
+
+```{r controles}
+uiOutput("ui_ocas")
+
+fluidRow(
+  column(3, sliderInput("m", "Ocasiones por año (diseño futuro)",
+                        min = 1, max = 10, value = 5, step = 1, ticks = FALSE)),
+  column(3, sliderInput("tau", "Años entre relevamientos",
+                        min = 1, max = 6, value = 1, step = 1, ticks = FALSE)),
+  column(3, sliderInput("anios", "Años para evaluar el cambio",
+                        min = 3, max = 40, value = 10, step = 1, ticks = FALSE)),
+  column(3, sliderInput("piso", "Piso entre años (CV)",
+                        min = 0, max = 0.20, value = 0.05, step = 0.01, ticks = FALSE))
+)
+fluidRow(
+  column(4, radioButtons("compartido", "Las ocasiones de un mismo año son:",
+                         choices = c("cercanas en el tiempo (la variación entre momentos se comparte, pasa a ser el PISO)" = "si",
+                                     "separadas en el tiempo (la variación entre momentos se promedia)" = "no"),
+                         selected = "si")),
+  column(8, helpText("Con ocasiones cercanas, agregar ocasiones reduce sólo el error de conteo; la variación entre momentos queda fija y actúa como piso. Con ocasiones separadas, cada ocasión aporta independencia y el promedio la reduce."))
+)
+```
+
+## 3. Historia y componentes
+
+```{r resumen}
+renderUI({
+  h <- H(); c0 <- cc(); d <- dl()
+  sel <- sort(unique(d$pasada))
+  HTML(paste0(
+    "<b>", length(h$transectas), " transectas</b> (", h$filas, " registros de perro), ",
+    h$K, " ocasiones. Usadas: ", paste(sel, collapse = ", "), ". ",
+    "Sin foto (SF) contados como perro visto: ", h$sf_total, ".<br/>",
+    "Densidad media por ocasión (perros/km): ",
+    paste(sprintf("%.2f", tapply(d$conteo, d$pasada, sum) / tapply(d$km, d$pasada, sum)),
+          collapse = " · "), ".",
+    if (is.null(L())) "<br/><span style='color:firebrick'>Sin longitudes: el índice es conteo por tramo.</span>" else ""
+  ))
+})
+
+renderUI({
+  c0 <- cc()
+  HTML(paste0(
+    "Error de conteo por ocasión (CV): <b>", sprintf("%.1f", 100 * c0$cv_conteo), " %</b>. ",
+    "Variación entre ocasiones (CV): <b>", sprintf("%.1f", 100 * c0$cv_pasada), " %</b>.<br/>",
+    "<i>La variación entre ocasiones se estima con sesgo positivo cuando es chica; el ",
+    "valor es una cota superior razonable, no una medición exacta.</i>"))
+})
+```
+
+```{r grafico_ocasiones}
+renderPlot({
+  d  <- dl(); c0 <- cc()
+  g  <- aggregate(cbind(conteo, km) ~ pasada, data = d, FUN = sum)
+  g$indice <- g$conteo / g$km
+  g$ic <- 1.96 * g$indice * c0$cv_conteo
+  media <- sum(d$conteo) / sum(d$km)
+  ggplot(g, aes(factor(pasada), indice)) +
+    geom_hline(yintercept = media, linetype = "dashed", color = "grey55") +
+    geom_errorbar(aes(ymin = indice - ic, ymax = indice + ic), width = 0.15, color = "#1b6ca8") +
+    geom_point(size = 3.2, color = "#1b6ca8") +
+    labs(x = "Ocasión", y = "Densidad (perros/km)",
+         title = "Índice por ocasión (barras: error de conteo)") +
+    theme_minimal(base_size = 12) + theme(panel.grid.minor = element_blank())
+}, height = 260)
+```
+
+## 4. Diseño del monitoreo
+
+```{r resultado}
+res <- reactive({
+  c0 <- cc()
+  cv <- cv_campania_app(c0, c0$k0, input$m, input$piso, input$compartido == "si")
+  n  <- anios_a_n(input$anios, input$tau)
+  list(cv = cv, n = n, cambio = abs(cambio_minimo_detectable(n, cv, input$tau)))
+})
+
+renderUI({
+  r <- res()
+  validate(need(r$n >= 3, "Con menos de 3 campañas no se puede ajustar una tendencia: subí los años o bajá el intervalo."))
+  HTML(paste0(
+    "<div style='background:#eef4fa;padding:9px;border-left:4px solid #08306b'>",
+    "Con <b>", input$anios, " años</b>, una campaña cada <b>", input$tau,
+    ifelse(input$tau == 1, " año", " años"), "</b> (", r$n, " campañas) y <b>", input$m,
+    ifelse(input$m == 1, " ocasión", " ocasiones"), "</b> por campaña:<br/>",
+    "CV por campaña = <b>", sprintf("%.1f", 100 * r$cv), " %</b><br/>",
+    "<span style='font-size:15px'>Cambio anual mínimo detectable: <b>",
+    sprintf("%.2f", r$cambio), " % por año</b></span><br/>",
+    "Equivale a un cambio total de <b>", sprintf("%.1f", cambio_total_pct(r$cambio, input$anios)),
+    " %</b> en ", input$anios, " años.</div>"))
+})
+```
+
+```{r grafico_ocasiones_diseno}
+renderPlot({
+  c0 <- cc(); p <- input$piso
+  df <- expand.grid(m = 1:10, compartido = c(TRUE, FALSE))
+  df$cv <- 100 * mapply(function(m, s) cv_campania_app(c0, c0$k0, m, p, s), df$m, df$compartido)
+  df$metodo <- ifelse(df$compartido, "ocasiones cercanas (componente compartido)",
+                                     "ocasiones separadas (promedio)")
+  ggplot(df, aes(m, cv, color = metodo)) +
+    geom_line(linewidth = 1.1) + geom_point(size = 2) +
+    geom_vline(xintercept = input$m, linetype = "dotted", color = "grey40") +
+    scale_color_manual(values = c("#d94801", "#1b6ca8"), name = NULL) +
+    scale_x_continuous(breaks = 1:10) + scale_y_continuous(limits = c(0, NA)) +
+    labs(x = "Ocasiones por año", y = "CV por campaña (%)",
+         title = "Cuántas ocasiones conviene hacer según cómo se espacian") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank(), legend.position = "top")
+}, height = 300)
+```
+
+```{r grafico_anios}
+renderPlot({
+  r <- res()
+  amax <- max(20, input$anios + 4)
+  taus <- sort(unique(c(1, 2, 4, input$tau)))
+  df <- expand.grid(anios = 3:amax, tau = taus)
+  df$n <- anios_a_n(df$anios, df$tau)
+  df$cambio <- abs(cambio_minimo_detectable(df$n, r$cv, df$tau))
+  df$intervalo <- factor(paste0("cada ", df$tau, ifelse(df$tau == 1, " año", " años")))
+  df <- df[df$n >= 3, ]
+  ggplot(df, aes(anios, cambio, color = intervalo, group = intervalo)) +
+    geom_line(linewidth = 1) +
+    geom_point(data = data.frame(anios = input$anios, cambio = r$cambio),
+               aes(anios, cambio), color = "firebrick", size = 3.6, inherit.aes = FALSE) +
+    scale_color_brewer(palette = "Dark2", name = "Intervalo") +
+    scale_x_continuous(breaks = seq(4, amax, 2)) + scale_y_continuous(limits = c(0, NA)) +
+    labs(x = "Años calendario de monitoreo", y = "Cambio anual mínimo detectable (%)",
+         title = "Punto rojo = diseño elegido") +
+    theme_minimal(base_size = 12) + theme(panel.grid.minor = element_blank(), legend.position = "top")
+}, height = 320)
+```
+
+---
+
+**Qué supone este cálculo.** Las cifras de potencia usan el CV estimado de esta historia,
+con los supuestos de la sección superior. Si las transectas dejaran de ser permanentes,
+la variación entre transectas volvería a entrar en la comparación. Si las ocasiones de un
+mismo año estuvieran separadas en el tiempo, convendría usar la segunda opción de
+espaciamiento. El piso entre años no se estima con una sola campaña: fijarlo es un
+supuesto que conviene explorar en el rango 0,03 a 0,10.

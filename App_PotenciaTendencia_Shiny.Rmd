@@ -1,0 +1,154 @@
+---
+title: "Magnitud porcentual del cambio anual detectable de tendencias de abundancia en función del intervalo de tiemo entre evaluaciones y  de la cantidad de años para detectar el cambio"
+output: html_document
+runtime: shiny
+---
+
+Gerrodette (1987) / Buckland et al. (2004), generalizado a un intervalo `tau` entre
+relevamientos. 
+Moviendo los controles se recalcula en vivo la magnitud mínima de cambio anual
+detectable, 
+con potencia fija en 0,80 y significancia alfa fija en 0,05.
+
+**Para usarla:** abrir este archivo en RStudio y apretar el botón **"Run Document"** (no "Knit";
+ese botón solo aparece porque el encabezado tiene `runtime: shiny`). Necesita los paquetes
+`shiny` y `tidyverse` instalados.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(shiny)
+library(tidyverse)
+library(scales)
+```
+
+```{r funciones}
+# --- Funciones de potencia de tendencia (Gerrodette 1987, generalizada a tau) ---
+
+# Magnitud mínima de cambio anual detectable (%), dado n relevamientos,
+# CV de cada estimación de N, intervalo tau (años) entre relevamientos,
+# significancia alpha y potencia power
+magnitud_minima_detectable <- function(n, CV, tau, alpha = 0.05, power = 0.8) {
+  z_alpha <- qnorm(1 - alpha / 2)
+  z_beta  <- qnorm(power)
+  ln_lambda_min <- sqrt(12) * (z_alpha + z_beta) * CV / (tau * (n - 1)^1.5)
+  lambda_min <- exp(ln_lambda_min)
+  (lambda_min - 1) * 100
+}
+
+# Número de relevamientos para un numero de anios calendario y un intervalo tau dados
+anios_a_n <- function(anios, tau) {
+  n <- floor(anios / tau) + 1
+  pmax(n, 2)   # minimo 2 relevamientos para poder ajustar una tendencia
+}
+```
+
+## Controles
+
+```{r controles}
+fluidRow(
+  column(4,
+    sliderInput("CV", "Coeficiente de variación (CV) de cada relevamiento:",
+                min = 0.02, max = 0.40, value = 0.10, step = 0.005)
+  ),
+  column(4,
+    sliderInput("tau", "Intervalo entre relevamientos (años):",
+                min = 1, max = 6, value = 4, step = 1)
+  ),
+  column(4,
+    sliderInput("anios", "Años calendario disponibles:",
+                min = 2, max = 40, value = 12, step = 1)
+  )
+)
+
+helpText("Significancia (alpha) = 0,05 (dos colas). Potencia = 0,80. Ambos fijos.")
+```
+
+## Resultado
+
+```{r resumen}
+
+
+
+resultado <- reactive({
+  n <- anios_a_n(input$anios, input$tau)
+  cambio_min <- abs(magnitud_minima_detectable(n, input$CV, input$tau))
+  list(n = n, cambio_min = cambio_min)
+})
+
+renderUI({
+  r <- resultado()
+  HTML(paste0(
+    "Con ", input$anios, " años disponibles (", r$n, " relevamientos, uno cada ",
+    input$tau, " año", ifelse(input$tau == 1, "", "s"), ") y CV = ", input$CV, ".",
+    "<br/>",
+    "El diseño detecta con potencia 0,80 un cambio anual mínimo de ",
+    round(r$cambio_min, 2), "% por año."
+  ))
+})
+```
+
+## Magnitud mínima detectable vs. años disponibles (intervalo y CV elegidos)
+
+```{r grafico_principal}
+renderPlot({
+  r <- resultado()
+
+  anios_max <- max(20, input$anios + 5)
+  anios_seq <- seq(2, anios_max, by = 1)
+  n_seq <- anios_a_n(anios_seq, input$tau)
+  cambio_seq <- abs(magnitud_minima_detectable(n_seq, input$CV, input$tau))
+
+  df <- tibble(anios = anios_seq, cambio_min = cambio_seq)
+
+  ggplot(df, aes(x = anios, y = cambio_min)) +
+    geom_line(linewidth = 1.1, color = "steelblue") +
+    geom_segment(aes(x = input$anios, xend = input$anios, y = 0, yend = r$cambio_min),
+                 linetype = "dashed", color = "firebrick") +
+    geom_segment(aes(x = 0, xend = input$anios, y = r$cambio_min, yend = r$cambio_min),
+                 linetype = "dashed", color = "firebrick") +
+    geom_point(aes(x = input$anios, y = r$cambio_min), color = "firebrick", size = 4) +
+    labs(
+      x = "Años calendarios disponibles",
+      y = "Magnitud mínima de cambio anual detectable (%)",
+      title = paste0("CV = ", input$CV, "  |  Intervalo = cada ", input$tau,
+                      " año(s)  |  Potencia = 0,80")
+    ) +
+    scale_x_continuous(breaks = seq(0, anios_max, by = 2)) +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +
+    theme_minimal(base_size = 13) +
+    theme(axis.text.x = element_text(angle = 0))
+}, height = 400)
+```
+
+## Comparación con los intervalos de referencia (1, 2 y 4 años)
+
+```{r grafico_comparativo}
+renderPlot({
+  anios_max <- max(20, input$anios + 5)
+  anios_seq <- seq(2, anios_max, by = 1)
+  taus_ref  <- sort(unique(c(1, 2, 4, input$tau)))
+
+  df <- expand_grid(anios = anios_seq, tau = taus_ref) %>%
+    mutate(
+      n          = anios_a_n(anios, tau),
+      cambio_min = abs(magnitud_minima_detectable(n, input$CV, tau)),
+      tau_lab    = paste0("cada ", tau, " año", ifelse(tau == 1, "", "s")),
+      destacado  = tau == input$tau
+    )
+
+  ggplot(df, aes(x = anios, y = cambio_min, color = tau_lab, group = tau_lab,
+                  linewidth = destacado)) +
+    geom_line() +
+    geom_vline(xintercept = input$anios, linetype = "dotted", color = "gray40") +
+    scale_linewidth_manual(values = c(`TRUE` = 1.6, `FALSE` = 0.7), guide = "none") +
+    labs(
+      x = "Años calendarios disponibles",
+      y = "Magnitud mínima detectable (%)",
+      color = "Intervalo",
+      title = paste0("Comparación de intervalos (CV = ", input$CV, "); línea gruesa = elegido")
+    ) +
+    scale_x_continuous(breaks = seq(0, anios_max, by = 2)) +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +
+    theme_minimal(base_size = 12)
+}, height = 350)
+```

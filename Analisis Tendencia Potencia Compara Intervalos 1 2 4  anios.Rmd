@@ -1,0 +1,225 @@
+---
+title: "Potencia de tendencia - Comparación de intervalos de relevamiento (1, 2 y 4 años)"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+date: "`r Sys.Date()`"
+---
+
+Compara gráficamente las consecuencias de espaciar los relevamientos PoissonMR cada 1, 2 o 4
+años, sobre: (a) los años calendario necesarios para detectar una tendencia dada con potencia
+0.8, (b) el número de relevamientos necesarios, y (c) la magnitud mínima de cambio detectable
+para un horizonte de tiempo fijo.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 7, fig.height = 4.5)
+```
+
+```{r librerias}
+library(tidyverse)
+```
+
+## 1. Funciones de potencia de tendencia (Gerrodette 1987, generalizada a intervalo tau)
+
+```{r funciones_potencia}
+n_relevamientos_necesarios <- function(CV, lambda, alpha = 0.05, power = 0.8, tau = 4) {
+  z_alpha <- qnorm(1 - alpha / 2)
+  z_beta  <- qnorm(power)
+  ln_lambda <- log(lambda)
+  ns <- 1 + ( (12 * (z_alpha + z_beta)^2 * CV^2) / (tau^2 * ln_lambda^2) )^(1/3)
+  ceiling(ns)
+}
+
+anios_calendario <- function(ns, tau = 4) {
+  (ns - 1) * tau
+}
+
+magnitud_minima_detectable <- function(ns, CV, alpha = 0.05, power = 0.8, tau = 4) {
+  z_alpha <- qnorm(1 - alpha / 2)
+  z_beta  <- qnorm(power)
+  ln_lambda_min <- sqrt(12) * (z_alpha + z_beta) * CV / (tau * (ns - 1)^1.5)
+  lambda_min <- exp(ln_lambda_min)
+  (lambda_min - 1) * 100
+}
+```
+
+## 2. Parámetros a comparar
+
+```{r parametros}
+# reemplazar por el CV real de tu modelo PoissonMR (tabla_resumen_zero$N_CV)
+CV_referencia <- 0.1
+
+# los tres esquemas de intervalo a comparar
+intervalos <- c(1, 2, 4)
+
+# grilla de tasas de cambio anual a detectar (negativo = declive), en %
+grilla_cambio <- seq(-2, -15, by = -1)
+```
+
+## 3. Años calendario necesarios vs. magnitud de cambio a detectar, por intervalo
+
+```{r datos_anios_vs_cambio}
+datos_anios <- expand_grid(
+  tau        = intervalos,
+  cambio_pct = grilla_cambio
+) %>%
+  mutate(
+    lambda           = 1 + cambio_pct / 100,
+    relevamientos    = pmap_dbl(list(CV_referencia, lambda, tau),
+                                 ~ n_relevamientos_necesarios(..1, ..2, tau = ..3)),
+    anios_calendario = anios_calendario(relevamientos, tau),
+    tau_lab          = paste0("cada ", tau, " año", ifelse(tau == 1, "", "s"))
+  )
+```
+
+```{r grafico_anios_vs_cambio}
+ggplot(datos_anios, aes(x = abs(cambio_pct), y = anios_calendario,
+                         color = tau_lab, group = tau_lab)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  labs(
+    x = "Magnitud del cambio anual a detectar (%)",
+    y = "Años calendarios necesarios",
+    color = "Intervalo de\nrelevamiento",
+    title = paste0("Años necesarios para Potencia = 0,8 (CV = ", CV_referencia*100, "%)")
+  ) +
+  theme_bw(base_size = 12) +
+    scale_x_continuous(breaks = seq(2, 16,by = 2)) +
+  scale_y_continuous(limits = c(1, 12),
+                   breaks = seq(0,12,by=2))
+ 
+
+ggsave("Años vs Magnitud.png", width=15, heigh=10, units="cm")
+```
+
+## 4. Número de relevamientos necesarios vs. magnitud de cambio, por intervalo
+
+```{r grafico_relevamientos_vs_cambio}
+ggplot(datos_anios, aes(x = abs(cambio_pct), y = relevamientos,
+                         color = tau_lab, group = tau_lab)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  labs(
+    x = "Magnitud del cambio anual a detectar (%)",
+    y = "Relevamientos necesarios",
+    color = "Intervalo de\nrelevamiento",
+    title = paste0("Relevamientos necesarios para Potencia = 0,8 (CV = ", CV_referencia*100, "%)")
+  ) +
+  theme_bw(base_size = 12)+
+  scale_x_continuous(breaks = seq(2, 16,by = 2)) +
+  scale_y_continuous(limits = c(1, 12),
+                   breaks = seq(0,12,by=2))
+
+ggsave("Relevamientos vs Cambio Porcentual.png", width=15, heigh=10, units="cm")
+```
+
+## 5. Magnitud mínima detectable vs. años calendario ya invertidos, por intervalo
+
+Para un horizonte de tiempo fijo (eje x = años calendario transcurridos), ¿qué tan chico puede
+ser el cambio que el diseño todavía puede detectar con potencia 0.8?
+
+```{r datos_magnitud_vs_anios}
+datos_magnitud <- expand_grid(
+  tau           = intervalos,
+  relevamientos = 2:12
+) %>%
+  mutate(
+    anios_calendario = anios_calendario(relevamientos, tau),
+    cambio_min_pct   = map2_dbl(relevamientos, tau,
+                                 ~ magnitud_minima_detectable(.x, CV_referencia, tau = .y)),
+    tau_lab          = paste0("cada ", tau, " año", ifelse(tau == 1, "", "s"))
+  ) %>%
+  filter(anios_calendario <= 30)
+```
+
+```{r grafico_magnitud_vs_anios}
+ggplot(datos_magnitud, aes(x = anios_calendario, y = cambio_min_pct,
+                            color = tau_lab, group = tau_lab)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  labs(
+    x = "Años calendarios transcurridos",
+    y = "Magnitud mínima \nde cambio anual detectable (%)",
+    color = "Intervalo de\nrelevamiento",
+    title = paste0("Sensibilidad del diseño en el tiempo (CV = ", CV_referencia*100, "%)")
+  ) +
+  theme_bw(base_size = 12) +
+    scale_x_continuous(breaks = seq(min(datos_magnitud$anios_calendario), max(datos_magnitud$anios_calendario), by = 2)) +
+scale_y_continuous(limits = c(0, 20),
+                   breaks = seq(0,20,by=2))
+
+ggsave("Magnitud vs años.png", width=15, heigh=10, units="cm")
+```
+
+## 6. Sensibilidad al CV: años necesarios vs. CV, por intervalo (para una tasa de cambio fija)
+
+```{r datos_anios_vs_cv}
+cambio_fijo_pct <- -5   # tasa de cambio anual a detectar, fija en este panel
+
+datos_cv <- expand_grid(
+  tau = intervalos,
+  CV  = seq(0.02, 0.20, by = 0.01)
+) %>%
+  mutate(
+    lambda           = 1 + cambio_fijo_pct / 100,
+    relevamientos    = pmap_dbl(list(CV, lambda, tau),
+                                 ~ n_relevamientos_necesarios(..1, ..2, tau = ..3)),
+    anios_calendario = anios_calendario(relevamientos, tau),
+    tau_lab          = paste0("Cada ", tau, " año", ifelse(tau == 1, "", "s")),
+    CV_por = CV*100
+  ) 
+```
+
+```{r grafico_anios_vs_cv}
+ggplot(datos_cv, aes(x = CV_por, y = anios_calendario, color = tau_lab, group = tau_lab)) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = "Coeficiente de Variación (CV%) de cada estimación de N",
+    y = "Años calendarios necesarios",
+    color = "Intervalo de\nrelevamiento",
+    title = paste0("Sensibilidad al CV (cambio anual a detectar = ", cambio_fijo_pct, "%)")
+  ) +
+  theme_bw(base_size = 12) +
+  scale_x_continuous(breaks = seq(min(datos_cv$CV_por), max(datos_cv$CV_por), by = 2)) +
+scale_y_continuous(breaks = seq(min(datos_cv$anios_calendario), max(datos_cv$anios_calendario), by = 2))
+
+ggsave("Años vs CV.png", width=15, heigh=10, units="cm")
+
+```
+
+## 7. Tabla resumen comparativa (un escenario puntual)
+
+```{r tabla_resumen}
+tabla_comparativa <- tibble(
+  tau = intervalos
+) %>%
+  mutate(
+    tau_lab          = paste0("cada ", tau, " año", ifelse(tau == 1, "", "s")),
+    relevamientos    = map_dbl(tau, ~ n_relevamientos_necesarios(CV_referencia, 1 + cambio_fijo_pct / 100, tau = .x)),
+    anios_calendario = anios_calendario(relevamientos, tau)
+  ) %>%
+  select(tau_lab, relevamientos, anios_calendario)
+
+tabla_comparativa
+```
+
+## Notas
+
+- `CV_referencia` y `cambio_fijo_pct` son los dos parámetros que más conviene ajustar con datos
+  reales antes de interpretar los gráficos: reemplazar `CV_referencia` por el CV que efectivamente
+  te dé tu modelo PoissonMR, y `cambio_fijo_pct` por la magnitud de declive/incremento que te
+  interese poder detectar en la práctica.
+- Los gráficos de la sección 3 y 4 muestran el mismo patrón desde dos ángulos: para una magnitud de
+  cambio dada, el esquema anual necesita menos años calendario pero más relevamientos; el esquema
+  cada 4 años necesita más años calendario pero menos relevamientos — la curva de "años calendario"
+  de cada 4 años queda sistemáticamente por encima de la anual (factor ≈ τ^(1/3)).
+- La sección 5 responde una pregunta distinta: a igual tiempo transcurrido (no igual cantidad de
+  relevamientos), qué tan sensible es cada esquema. Ahí el esquema anual suele ser más sensible
+  (detecta cambios más chicos) para un mismo horizonte de años, porque acumula más puntos en ese
+  lapso.
+- Todos los gráficos usan el mismo CV para los tres esquemas, asumiendo que la precisión de cada
+  relevamiento individual no cambia por espaciarlos más. Si espaciar los relevamientos permite
+  invertir más esfuerzo por campaña (más ocasiones de reavistaje, mejor cobertura), el CV real del
+  esquema cada 2 o 4 años podría ser menor al usado acá, lo cual achicaría la brecha con el esquema
+  anual.
