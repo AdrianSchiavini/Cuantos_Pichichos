@@ -92,11 +92,11 @@ Ush_campania_2024 <- Ush_indice_razon_2024 %>%
 
 Ush_densidades_2024 <- bind_rows(Ush_indice_razon_2024, Ush_campania_2024)
 
-# variación entre ocasiones: desvío estándar del logaritmo del índice (aproxima el CV)
-cv_entre_ocasiones <- sd(log(Ush_indice_razon_2024$Indice))
+# variación observada entre ocasiones: desvío estándar del logaritmo del índice (no es el CV de la campaña)
+desvio_log_ocasiones <- sd(log(Ush_indice_razon_2024$Indice))
 
 print(Ush_densidades_2024)
-cat("Variación entre ocasiones (CV aprox.):", round(100 * cv_entre_ocasiones, 1), "%\n")
+cat("Variación observada entre ocasiones (desvío del log, no es CV de campaña):", round(100 * desvio_log_ocasiones, 1), "%\n")
 
 # exporta con coma decimal
 Ush_densidades_2024 %>%
@@ -149,6 +149,152 @@ write_delim(Ush_heterogeneidad_2024, "Ush_heterogeneidad_2024.txt", delim = "\t"
 ```
 
 
+## CV de la campaña y de cada pasada
+
+Esta sección usa el mismo estimador que la app de índice y la app de la historia (`descomponer_anio()`, copiado sin cambios). Su referencia simulada usa números aleatorios, así que se fija una semilla para que el reparto entre conteo y pasada se reproduzca.
+
+```{r cv_funciones}
+descomponer_anio <- function(x) {
+  x$pasada    <- factor(x$pasada)
+  x$transecta <- factor(x$transecta)
+  J <- nlevels(x$pasada)
+  if (J < 2) stop("Hacen falta al menos dos pasadas por año.")
+
+  # Esperado por tramo sin efecto de pasada (el tramo absorbe el promedio).
+  fit0 <- glm(conteo ~ transecta, family = poisson, offset = log(km), data = x)
+  e    <- fitted(fit0)
+
+  # Estimador de razón por pasada, en log: es la misma cantidad que entra en
+  # el índice anual (suma de conteos / suma de km), así que el piso y los
+  # componentes se miden en la misma escala.
+  num <- tapply(x$conteo, x$pasada, sum)
+  den <- tapply(e, x$pasada, sum)
+  r   <- log(num / den)
+  var_tot <- var(r)
+
+  # Sobredispersión (binomial negativa) por momentos, con los residuos
+  # corregidos por apalancamiento del tramo.
+  h0    <- pmin(hatvalues(fit0), 0.95)
+  theta <- sum(e^2) / max(1e-6, sum((x$conteo - e)^2 / (1 - h0) - e))
+
+  # Referencia nula: si no hubiera variación entre pasadas, el mismo
+  # estadístico var(log(num_j/den_j)) se simula desde el ajuste. Su valor
+  # esperado es el error de conteo "visto por el estimador", y se resta.
+  B_ref <- 300
+  r_nulo <- replicate(B_ref, {
+    ys <- if (is.finite(theta)) rnbinom(length(e), mu = e, size = theta)
+          else rpois(length(e), e)
+    var(log(tapply(ys, x$pasada, sum) / den))
+  })
+  var_cont <- mean(r_nulo)
+
+  list(J = J, var_cont = var_cont, var_tot = var_tot,
+       var_pasada = max(0, var_tot - var_cont),
+       dispersion = sum((x$conteo - e)^2 / e) / (nrow(x) - length(coef(fit0))))
+}
+```
+
+```{r cv_tabla}
+set.seed(2025)
+
+# Todas las transectas con longitud; las que no tienen registros cuentan 0
+Conteos_completos <- Transectas_Ushuaia %>%
+  left_join(Perro_Ush_ocasion_2024, by = "Transecta") %>%
+  mutate(across(starts_with("Muestreo"), ~ replace_na(.x, 0)))
+km_tr <- Conteos_completos$Longitud / 1000
+C     <- as.matrix(Conteos_completos[, paste0("Muestreo ", 1:5)])
+k     <- nrow(C)     # transectas del diseño (igual a k0, los datos de referencia)
+m     <- ncol(C)     # pasadas por campaña
+
+# CV de cada pasada: precisión del índice de esa pasada, con las transectas como muestra
+# (estimador de razón linealizado)
+I_j <- colSums(C) / sum(km_tr)
+cv_pasada_muestreo <- sapply(seq_len(m), function(j) {
+  e <- C[, j] - I_j[j] * km_tr
+  sqrt(k / (k - 1) * sum(e^2)) / sum(km_tr) / I_j[j]
+})
+
+# Componentes de la campaña: error de conteo y efecto de pasada
+largo <- data.frame(pasada = rep(seq_len(m), each = k),
+                    transecta = rep(Conteos_completos$Transecta, m),
+                    km = rep(km_tr, m), conteo = as.vector(C))
+d_anio      <- suppressWarnings(descomponer_anio(largo))
+cv_conteo   <- sqrt(d_anio$var_cont)
+cv_pasada   <- sqrt(d_anio$var_pasada)
+k0          <- k
+cv_campania <- function(piso) sqrt(piso^2 + cv_pasada^2 + cv_conteo^2 * k0 / (k * m))
+
+tabla_cv_2024 <- tibble(
+  Grupo = c(rep("Por pasada", m), rep("Componentes", 2), rep("Campaña", 2), "Descriptivo"),
+  Medida = c(paste("Pasada", seq_len(m)), "Error de conteo", "Efecto de pasada",
+             "Campaña, piso 0", "Campaña, piso 0,05 (supuesto)",
+             "Variación observada entre pasadas"),
+  CV = c(100 * cv_pasada_muestreo, 100 * cv_conteo, 100 * cv_pasada,
+         100 * cv_campania(0), 100 * cv_campania(0.05), 100 * desvio_log_ocasiones),
+  Que_mide = c(rep("Dispersión entre transectas dentro de la pasada; no es precisión de la campaña", m),
+               "Azar del conteo en cada transecta; baja al agregar transectas o pasadas",
+               "Día, clima, horario y observador; no baja al agregar transectas",
+               "Fórmula de la campaña sin piso entre años",
+               "Fórmula con piso supuesto; no se estima con una sola campaña",
+               "Desvío estándar del logaritmo de los índices por pasada (4 g.l.); no es CV de campaña")
+)
+```
+
+```{r cv_gt}
+library(gt)
+
+tabla_cv_2024 %>%
+  gt(groupname_col = "Grupo", rowname_col = "Medida") %>%
+  tab_header(
+    title    = md("**CV del índice de densidad: cada pasada y la campaña**"),
+    subtitle = "Ushuaia, 2024 · 5 pasadas, 47 transectas"
+  ) %>%
+  cols_label(CV = "CV (%)", Que_mide = "Qué mide") %>%
+  fmt_number(columns = CV, decimals = 1, dec_mark = ",", sep_mark = "") %>%
+  cols_align(align = "left", columns = Que_mide) %>%
+  cols_align(align = "center", columns = CV) %>%
+  tab_source_note("Piso entre años: supuesto, no se estima con una sola campaña. Referencia simulada con semilla 2025.") %>%
+  tab_options(
+    table.font.names = "Arial", table.font.size = px(13),
+    heading.align = "left", heading.title.font.size = px(17), heading.subtitle.font.size = px(12),
+    column_labels.font.weight = "bold", column_labels.background.color = "#DCE6F2",
+    row_group.font.weight = "bold", row_group.background.color = "#EEF4FA",
+    table.border.top.color = "#08306B", table.border.top.width = px(2),
+    table.border.bottom.color = "#08306B", table.border.bottom.width = px(2),
+    data_row.padding = px(5)
+  )
+
+gtsave(tabla_cv_2024 %>% gt(groupname_col = "Grupo", rowname_col = "Medida"), "CV_Ushuaia_2024.html")
+```
+
+Versión para pegar en un informe de Word (paquete `flextable`)
+
+```{r cv_word}
+library(flextable)
+
+ft_cv_2024 <- tabla_cv_2024 %>%
+  select(Grupo, Medida, CV, Que_mide) %>%
+  flextable() %>%
+  set_header_labels(Grupo = "Tipo", Medida = "Medida", CV = "CV (%)", Que_mide = "Qué mide") %>%
+  merge_v(j = "Grupo") %>%
+  colformat_double(j = "CV", digits = 1, decimal.mark = ",", big.mark = "") %>%
+  add_header_lines("CV del índice de densidad: cada pasada y la campaña. Ushuaia, 2024 (5 pasadas, 47 transectas)") %>%
+  add_footer_lines("Piso entre años: supuesto, no se estima con una sola campaña. Referencia simulada con semilla 2025.") %>%
+  theme_booktabs() %>%
+  font(fontname = "Arial", part = "all") %>%
+  fontsize(size = 9.5, part = "all") %>%
+  bg(part = "header", bg = "#DCE6F2") %>%
+  bold(part = "header") %>%
+  valign(j = "Grupo", valign = "top", part = "body") %>%
+  align(j = "CV", align = "center", part = "all") %>%
+  width(j = "Grupo", width = 2.6) %>%
+  width(j = "Medida", width = 4.2) %>%
+  width(j = "CV", width = 1.6) %>%
+  width(j = "Que_mide", width = 8.6)
+
+save_as_docx(ft_cv_2024, path = "CV_Ushuaia_2024.docx")
+```
+
 Tablas elegantes del índice de razón por ocasión. Se usan los paquetes `gt` (para el documento HTML)
 y `flextable` (para Word); se instalan una vez con `install.packages(c("gt", "flextable"))`.
 
@@ -157,10 +303,10 @@ library(gt)
 
 n_transectas  <- nrow(Ushuaia_conteo_km_2024)   # transectas, las mismas en cada ocasión
 fila_campania <- nrow(Ush_densidades_2024)       # última fila: índice de la campaña
-cv_txt  <- formatC(100 * cv_entre_ocasiones, format = "f", digits = 1, decimal.mark = ",")
+cv_txt  <- formatC(100 * desvio_log_ocasiones, format = "f", digits = 1, decimal.mark = ",")
 nota_1  <- paste0("Índice = perros contados / km recorridos; los avistajes sin foto cuentan como perro visto. n = ",
                   n_transectas, " transectas, las mismas en cada ocasión.")
-nota_2  <- paste0("Variación entre ocasiones: CV aprox. ", cv_txt, " % (desvío estándar del logaritmo del índice, ",
+nota_2  <- paste0("Variación observada entre ocasiones: ", cv_txt, " % (desvío estándar del logaritmo del índice, ",
                   nrow(Ush_indice_razon_2024) - 1, " grados de libertad).")
 
 tabla_densidades_2024 <- Ush_densidades_2024 %>%
